@@ -1,20 +1,17 @@
 import os
+import base64
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from openai import OpenAI
-import requests
-import base64
 import boto3
-from flask_cors import CORS 
+import requests
+from flask_cors import CORS
+from openai import OpenAI
 
-# Load environment variables first
 load_dotenv()
 
-# Initialize OpenAI client
-api_key = os.getenv('OPENAI_API_KEY')  # Use getenv() instead of environ.get for consistency
-client = OpenAI(api_key=api_key)  # Fixed: added keyword argument
+api_key = os.getenv('OPENAI_API_KEY')
+client = OpenAI(api_key=api_key)
 
-# Initialize AWS Polly client
 polly_client = boto3.client(
     'polly',
     aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
@@ -25,61 +22,78 @@ polly_client = boto3.client(
 app = Flask(__name__)
 CORS(app)
 
-@app.route('/evaluate-pronunciation', methods=['POST'])
-def evaluate_pronunciation():
-    audio_file = request.files['file']
-    audio_path = 'user_audio.mp3'
-    audio_file.save(audio_path)
+# Conversation memory for a single user (demo).
+# In production, store per-user sessions in a DB or similar.
+conversation_history = [
+    {
+        "role": "system",
+        "content": (
+            "You are a friendly English tutor and conversation partner, specialized "
+            "in teaching North American English pronunciation. You will: "
+            "1) Have a normal conversation with the user, "
+            "2) Provide specific pronunciation corrections whenever relevant, "
+            "3) Respond in a supportive, engaging manner. "
+            "Use the context of the conversation to maintain continuity."
+        )
+    }
+]
 
-    transcript = transcribe_with_whisper(audio_path)
-    evaluation = evaluate_with_gpt(transcript)
-    feedback_audio = synthesize_with_polly(evaluation)
+@app.route('/chat', methods=['POST'])
+def chat():
+    """
+    Endpoint to handle either:
+      - Audio input (multipart/form-data, 'file')
+      - Text input (JSON, 'message')
+    Then we pass user input to GPT (with conversation history),
+    get a response, synthesize TTS, and return both text + audio.
+    """
+    user_message = None
+
+    # Check if an audio file was uploaded
+    if 'file' in request.files:
+        audio_file = request.files['file']
+        audio_path = 'user_audio.mp3'
+        audio_file.save(audio_path)
+
+        # Transcribe user audio (forced English)
+        user_message = transcribe_with_whisper(audio_path)
+    else:
+        data = request.get_json()
+        user_message = data.get('message', '')
+
+    if not user_message:
+        return jsonify({"error": "No user message provided"}), 400
+
+    # Append user's message to conversation history
+    conversation_history.append({"role": "user", "content": user_message})
+
+    # GPT call with entire conversation history
+    response = client.chat.completions.create(
+        model="gpt-4-turbo",
+        messages=conversation_history,
+        temperature=0.7
+    )
+
+    bot_message = response.choices[0].message.content.strip()
+    conversation_history.append({"role": "assistant", "content": bot_message})
+
+    # Synthesize TTS using AWS Polly
+    audio_base64 = synthesize_with_polly(bot_message)
 
     return jsonify({
-        'transcript': transcript,
-        'evaluation': evaluation,
-        'feedback_audio': feedback_audio.decode('utf-8')
+        "bot_text": bot_message,
+        "bot_audio": audio_base64.decode('utf-8'),
+        "conversation_history": conversation_history
     })
 
 def transcribe_with_whisper(audio_filepath):
     with open(audio_filepath, "rb") as audio:
         transcription = client.audio.transcriptions.create(
-            model="whisper-1", 
+            model="whisper-1",
             language="en",
             file=audio
         )
     return transcription.text
-
-def evaluate_with_gpt(transcript):
-    system_message = """
-    You are a friendly English pronunciation coach, specialized in teaching North American English. 
-    When the user gives you text from a speech recognition system, 
-    you will assume it reflects their actual speech. 
-    Your job is to provide:
-    1) Specific phonetic feedback on any likely mispronunciations
-    2) A severity rating (1=very minor, 5=severe)
-    3) Encouraging suggestions for improvement
-
-    Do not mention that you cannot hear them or that you lack audio.
-    Focus purely on the recognized text.
-    """
-
-    user_message = f"""
-    Here is the recognized transcript of what the user said:
-    "{transcript}"
-    Please provide your feedback accordingly.
-    """
-
-    response = client.chat.completions.create(
-        model="gpt-4-turbo",
-        messages=[
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_message}
-        ],
-        temperature=0.3
-    )
-    
-    return response.choices[0].message.content.strip()
 
 def synthesize_with_polly(text):
     response = polly_client.synthesize_speech(
@@ -88,14 +102,8 @@ def synthesize_with_polly(text):
         VoiceId='Joanna',
         Engine='neural'
     )
-    
-    # Correct way to handle the audio stream
-    if 'AudioStream' in response:
-        with response['AudioStream'] as stream:
-            audio_bytes = stream.read()
-        return base64.b64encode(audio_bytes)
-    else:
-        raise ValueError("No audio stream found in Polly response")
+    audio_bytes = response['AudioStream'].read()
+    return base64.b64encode(audio_bytes)
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
